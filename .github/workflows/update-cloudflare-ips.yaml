@@ -1,0 +1,81 @@
+name: Update Cloudflare IPs
+# Refreshes charts/envoy-gateway-config/files/cloudflare-ips.json, the list of
+# Cloudflare edge ranges the external gateway trusts X-Forwarded-For from.
+# Cloudflare changes this list rarely, so a weekly check is enough. When it
+# changed, this opens (or updates) a PR to master. Scheduled runs always use
+# the default branch (master), so the workflow reads and updates master.
+#
+# Pushes and opens the PR as a GitHub App, not with the Actions token, for two
+# reasons: the dfijapan org does not let the Actions token open PRs, and PRs
+# opened with the Actions token do not start other workflows such as
+# helm-validate. The App needs Contents and Pull requests set to read and
+# write, and must be installed on this repo. Its client id goes in the
+# AUTOMATION_APP_CLIENT_ID variable and its private key in the
+# AUTOMATION_APP_PRIVATE_KEY secret.
+on:
+  workflow_dispatch: {}
+  schedule:
+    # Mondays 00:00 UTC, 09:00 in Japan.
+    - cron: '0 0 * * 1'
+permissions:
+  contents: read
+jobs:
+  update:
+    name: Refresh Cloudflare IP ranges
+    runs-on: ubuntu-latest
+    env:
+      BRANCH: chore/cloudflare-ips
+    steps:
+      - name: Stand-in for the App token
+        id: app-token
+        run: echo "token=${{ github.token }}" >> "$GITHUB_OUTPUT"; echo app-slug=github-actions >> "$GITHUB_OUTPUT"
+      - name: Checkout master
+        uses: actions/checkout@v7
+        with:
+          ref: master
+          # Pushes in the last step use this token, so they count as the App.
+          token: ${{ steps.app-token.outputs.token }}
+      - name: Fetch the current list
+        run: charts/envoy-gateway-config/update-cloudflare-ips.sh
+      - name: Open or update the PR if the list changed
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then
+            echo "Cloudflare IP ranges unchanged."
+            exit 0
+          fi
+          git diff
+          # Commit as the App's bot user so the commit links to it on GitHub.
+          bot_id=$(gh api "/users/${APP_SLUG}%5Bbot%5D" --jq .id)
+          git config user.name  "${APP_SLUG}[bot]"
+          git config user.email "${bot_id}+${APP_SLUG}[bot]@users.noreply.github.com"
+          git switch -c "$BRANCH"
+          git commit -am "envoy-gateway-config: update Cloudflare IP ranges"
+          git push --force origin "$BRANCH"
+          if [ -n "$(gh pr list --head "$BRANCH" --base master --state open --json number --jq '.[].number')" ]; then
+            echo "PR already open, branch updated."
+            exit 0
+          fi
+          gh pr create --base master --head "$BRANCH" \
+            --title "envoy-gateway-config: update Cloudflare IP ranges" \
+            --body "$(cat <<'EOF'
+          ## Why
+          Cloudflare changed its list of edge IP ranges, and the external gateway only reads X-Forwarded-For from those ranges.
+
+          ## What
+          Updates `charts/envoy-gateway-config/files/cloudflare-ips.json` from https://api.cloudflare.com/client/v4/ips.
+
+          ## Detailed Notes
+          Opened by the weekly `update-cloudflare-ips` workflow. If a range is missing, requests through Cloudflare from that range get Cloudflare's IP as the client IP instead of the real one.
+
+          Verified:
+          - [ ] helm-validate passed
+          - [ ] after merge, the `external-client-traffic` ClientTrafficPolicy is Accepted on both clusters
+          EOF
+          )"
+    permissions:
+      contents: write
+      pull-requests: write
